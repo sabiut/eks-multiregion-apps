@@ -32,16 +32,6 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # A real PostgreSQL beside the job, for the integration tests. It holds no data, lives
-    # only for this job and is reachable only from this runner, so it needs no password.
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -49,6 +39,17 @@ jobs:
           python-version: "3.13"
       - name: Install the backend's dependencies
         run: pip install --quiet -r backend/requirements.txt
+      # A real PostgreSQL beside the job, for the integration tests. Its password is
+      # generated here for this run only: it is never written in the repository, it is
+      # masked in the log, and it disappears with the runner.
+      - name: Start PostgreSQL with a one-time password
+        run: |
+          password=$(openssl rand -hex 24)
+          echo "::add-mask::$password"
+          echo "TEST_DB_PASSWORD=$password" >> "$GITHUB_ENV"
+          docker run -d --name test-postgres -e POSTGRES_PASSWORD="$password" -p 127.0.0.1:5432:5432 postgres:17-alpine
+          # Check over TCP: during first start-up the server briefly answers on its local socket only.
+          until docker exec test-postgres pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; do sleep 1; done
       - name: Unit and integration tests
         working-directory: backend
         env:

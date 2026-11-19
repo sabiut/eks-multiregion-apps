@@ -1,7 +1,8 @@
 """Integration tests against a real PostgreSQL. Skipped unless TEST_DB_HOST is set; the
 pipeline sets it and starts a database beside the job.
 
-  docker run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1:55432:5432 postgres:17-alpine
+  export TEST_DB_PASSWORD=$(openssl rand -hex 24)
+  docker run -d --name pg -e POSTGRES_PASSWORD=$TEST_DB_PASSWORD -p 127.0.0.1:55432:5432 postgres:17-alpine
   TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=55432 python3 -m unittest -v test_postgres
 """
 import os
