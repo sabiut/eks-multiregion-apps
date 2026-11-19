@@ -43,7 +43,8 @@ def database_settings():
         "dbname": read_secret("DB_NAME") or "postgres",
         "user": read_secret("DB_USER"),
         "password": read_secret("DB_PASSWORD"),
-        "sslmode": "require",      # encrypt the connection to RDS
+        # Encrypt the connection to RDS. Only the integration test turns this off.
+        "sslmode": os.environ.get("DB_SSLMODE", "require"),
         "connect_timeout": 3,
     }
 
@@ -76,6 +77,8 @@ def visits(add):
         try:
             row = connection.execute(f"SELECT count FROM {table} WHERE id = 1").fetchone()
         except psycopg.errors.UndefinedTable:
+            # Nothing has been recorded yet, so the table does not exist: the count is zero.
+            # (Covered by test_postgres.py against a real database.)
             row = None
         return (row[0] if row else 0), "postgres"
 

@@ -32,10 +32,27 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A real PostgreSQL beside the job, for the integration tests. It holds no data, lives
+    # only for this job and is reachable only from this runner, so it needs no password.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
-      - name: Unit tests
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install the backend's dependencies
+        run: pip install --quiet -r backend/requirements.txt
+      - name: Unit and integration tests
         working-directory: backend
+        env:
+          TEST_DB_HOST: 127.0.0.1
         run: python3 -m unittest -v
 
   image:
@@ -76,14 +93,40 @@ jobs:
         run: |
           account=$(aws sts get-caller-identity --query Account --output text)
           echo "::add-mask::$account"
+          digest_in() {   # the digest of this tag in a region, or nothing
+            aws ecr batch-get-image --region "$1" --repository-name "$IMAGE" --image-ids imageTag="$TAG" \
+              --query 'images[0].imageId.imageDigest' --output text 2>/dev/null | grep -E '^sha256:' || true
+          }
           for region in $REGIONS; do
-            registry="$account.dkr.ecr.$region.amazonaws.com"
-            aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry"
-            docker tag "$IMAGE:$TAG" "$registry/$IMAGE:$TAG"
-            # Tags are immutable in ECR: a second push of the same tag is refused, so a tag
-            # can never come to mean a different image.
-            docker push "$registry/$IMAGE:$TAG"
+            aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$account.dkr.ecr.$region.amazonaws.com"
           done
+
+          # Tags are immutable in ECR: a second push of the same tag is refused. So this
+          # step must be safe to run again after it failed half way. If an earlier attempt
+          # already published the tag somewhere, that published image is the source for the
+          # other regions, not the image this run just rebuilt (a rebuild can differ).
+          source="$IMAGE:$TAG"
+          for region in $REGIONS; do
+            if [ -n "$(digest_in "$region")" ]; then
+              source="$account.dkr.ecr.$region.amazonaws.com/$IMAGE:$TAG"
+              docker pull --quiet "$source"
+              break
+            fi
+          done
+          for region in $REGIONS; do
+            target="$account.dkr.ecr.$region.amazonaws.com/$IMAGE:$TAG"
+            if [ -n "$(digest_in "$region")" ]; then
+              echo "$region already has $IMAGE:$TAG"
+            else
+              docker tag "$source" "$target"
+              docker push --quiet "$target"
+            fi
+          done
+
+          # The release goes ahead only if every region holds the same image.
+          digests=$(for region in $REGIONS; do digest_in "$region"; done | sort -u)
+          [ "$(echo "$digests" | grep -c sha256)" = 1 ] || { echo "Regions hold different or missing images for $IMAGE:$TAG"; exit 1; }
+          echo "$IMAGE:$TAG is $digests in every region" >> "$GITHUB_STEP_SUMMARY"
 
   release-to-dev:
     needs: image
