@@ -73,6 +73,42 @@ jobs:
         run: echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
       - name: Build
         run: docker build -t "${{ matrix.name }}:${{ steps.meta.outputs.tag }}" "${{ matrix.context }}"
+      - name: Sign in to AWS
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.PRIMARY_REGION }}
+
+      # Tags are immutable in ECR: a second push of the same tag is refused. So a run that
+      # failed half way (pushed to one region, not the other) must be safe to run again.
+      # If an earlier attempt already published this tag, THAT image is the release, not
+      # the one this run just rebuilt (a rebuild can differ). Choosing it here, before the
+      # scan, means the image that is scanned is the image that is released.
+      - name: Choose the image to release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          IMAGE: ${{ matrix.name }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          echo "::add-mask::$account"
+          for region in $REGIONS; do
+            registry="$account.dkr.ecr.$region.amazonaws.com"
+            aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry"
+          done
+          for region in $REGIONS; do
+            digest=$(aws ecr batch-get-image --region "$region" --repository-name "$IMAGE" --image-ids imageTag="$TAG" \
+              --query 'images[0].imageId.imageDigest' --output text 2>/dev/null | grep -E '^sha256:' || true)
+            if [ -n "$digest" ]; then
+              published="$account.dkr.ecr.$region.amazonaws.com/$IMAGE:$TAG"
+              docker pull --quiet "$published"
+              docker tag "$published" "$IMAGE:$TAG"    # replaces the rebuild
+              echo "Using the image already published in $region ($digest)."
+              break
+            fi
+          done
+
       - name: Scan the image for known vulnerabilities
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -80,12 +116,7 @@ jobs:
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: "1"   # a critical vulnerability with a fix available stops the release
-      - name: Sign in to AWS
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_PUBLISH_ROLE_ARN }}
-          aws-region: ${{ env.PRIMARY_REGION }}
+
       - name: Push to ECR in each region
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         env:
@@ -98,28 +129,13 @@ jobs:
             aws ecr batch-get-image --region "$1" --repository-name "$IMAGE" --image-ids imageTag="$TAG" \
               --query 'images[0].imageId.imageDigest' --output text 2>/dev/null | grep -E '^sha256:' || true
           }
-          for region in $REGIONS; do
-            aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$account.dkr.ecr.$region.amazonaws.com"
-          done
-
-          # Tags are immutable in ECR: a second push of the same tag is refused. So this
-          # step must be safe to run again after it failed half way. If an earlier attempt
-          # already published the tag somewhere, that published image is the source for the
-          # other regions, not the image this run just rebuilt (a rebuild can differ).
-          source="$IMAGE:$TAG"
-          for region in $REGIONS; do
-            if [ -n "$(digest_in "$region")" ]; then
-              source="$account.dkr.ecr.$region.amazonaws.com/$IMAGE:$TAG"
-              docker pull --quiet "$source"
-              break
-            fi
-          done
+          # Push the scanned image to every region that does not have the tag yet.
           for region in $REGIONS; do
             target="$account.dkr.ecr.$region.amazonaws.com/$IMAGE:$TAG"
             if [ -n "$(digest_in "$region")" ]; then
               echo "$region already has $IMAGE:$TAG"
             else
-              docker tag "$source" "$target"
+              docker tag "$IMAGE:$TAG" "$target"
               docker push --quiet "$target"
             fi
           done
