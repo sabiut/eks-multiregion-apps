@@ -124,10 +124,16 @@ jobs:
             fi
           done
 
-          # The release goes ahead only if every region holds the same image.
-          digests=$(for region in $REGIONS; do digest_in "$region"; done | sort -u)
-          [ "$(echo "$digests" | grep -c sha256)" = 1 ] || { echo "Regions hold different or missing images for $IMAGE:$TAG"; exit 1; }
-          echo "$IMAGE:$TAG is $digests in every region" >> "$GITHUB_STEP_SUMMARY"
+          # The release goes ahead only if EVERY region answers with a digest, and they
+          # are all the same. A region with no image must fail this, not be ignored.
+          first=""
+          for region in $REGIONS; do
+            digest=$(digest_in "$region")
+            [ -n "$digest" ] || { echo "$region has no image for $IMAGE:$TAG"; exit 1; }
+            [ -z "$first" ] && first=$digest
+            [ "$digest" = "$first" ] || { echo "$region holds $digest, but another region holds $first"; exit 1; }
+          done
+          echo "$IMAGE:$TAG is $first in every region" >> "$GITHUB_STEP_SUMMARY"
 
   release-to-dev:
     needs: image
