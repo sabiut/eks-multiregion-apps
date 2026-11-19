@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+*.pem
+kubeconfig*
+/rendered/
+*.html
+# The frontend page is application source. Every other HTML file stays out.
+!frontend/index.html

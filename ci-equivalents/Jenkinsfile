@@ -1,0 +1,93 @@
+// The same pipeline as .github/workflows/ci.yml, written for Jenkins.
+// Reference only: this repository runs on GitHub Actions, and this file has not been run.
+// It is here to compare the vocabulary.
+//
+//   GitHub Actions            Jenkins
+//   workflow (YAML)           pipeline (Jenkinsfile, Groovy)
+//   job / step                stage / step
+//   runner                    agent (a node, or a pod started by the Kubernetes plugin)
+//   secrets, OIDC role        credentials store, withCredentials / withAWS
+//   environment + reviewers   input step
+//   on: push / pull_request   multibranch pipeline, triggered by a Bitbucket webhook
+//   if: github.ref == main    when { branch 'main' }
+//   reusable workflow         shared library
+pipeline {
+  agent { label 'docker' }
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+  }
+
+  environment {
+    PRIMARY_REGION = 'ap-southeast-2'
+    REGIONS        = 'ap-southeast-2 ap-southeast-1'
+    TAG            = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
+  }
+
+  stages {
+    stage('Test') {
+      steps { sh 'cd backend && python3 -m unittest -v' }
+    }
+
+    // Build once. Every environment runs these two images.
+    stage('Build') {
+      steps {
+        sh 'docker build -t "demo-api:$TAG" backend'
+        sh 'docker build -t "demo-web:$TAG" frontend'
+      }
+    }
+
+    stage('Scan') {
+      steps {
+        sh 'trivy image --severity CRITICAL --ignore-unfixed --exit-code 1 "demo-api:$TAG"'
+        sh 'trivy image --severity CRITICAL --ignore-unfixed --exit-code 1 "demo-web:$TAG"'
+      }
+    }
+
+    stage('Push') {
+      when { branch 'main' }
+      steps {
+        // The Jenkins agent's own IAM role, or a role assumed with the AWS Steps plugin.
+        withAWS(role: 'eks-multiregion-publish', region: env.PRIMARY_REGION) {
+          sh '''
+            account=$(aws sts get-caller-identity --query Account --output text)
+            for region in $REGIONS; do
+              registry="$account.dkr.ecr.$region.amazonaws.com"
+              aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry"
+              for image in demo-api demo-web; do
+                docker tag "$image:$TAG" "$registry/$image:$TAG"
+                docker push "$registry/$image:$TAG"
+              done
+            done
+          '''
+        }
+      }
+    }
+
+    stage('Release to dev') {
+      when { branch 'main' }
+      steps {
+        // Open a pull request in the GitOps repository that sets the dev image tag.
+        // An SSH key for Bitbucket, kept in the Jenkins credentials store.
+        sshagent(credentials: ['gitops-deploy-key']) {
+          sh '''
+            git clone git@bitbucket.org:your-team/eks-multiregion-gitops.git gitops && cd gitops
+            git switch -c "promote/dev-$TAG"
+            scripts/promote.sh dev "$TAG"
+            git commit -am "promote: demo $TAG to dev"
+            git push origin "promote/dev-$TAG"
+          '''
+        }
+        // stg and prd are promoted from the GitOps repository, with approvals there.
+        // This pipeline has no stage for them on purpose.
+      }
+    }
+  }
+
+  post {
+    failure { echo 'Notify the team channel here (Slack or email plugin).' }
+    always  { sh 'docker image rm "demo-api:$TAG" "demo-web:$TAG" || true' }
+  }
+}

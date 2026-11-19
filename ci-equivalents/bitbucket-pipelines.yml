@@ -1,0 +1,40 @@
+# The same pipeline for Bitbucket Pipelines (Bitbucket's built-in CI). Reference only, not run.
+#
+#   GitHub Actions            Bitbucket Pipelines
+#   workflow / job / step     pipeline / step
+#   runner                    build container (image:), or a self-hosted runner
+#   secrets                   repository or deployment variables (secured)
+#   OIDC to AWS               oidc: true on the step, then assume a role with the web identity
+#   environment               deployment: (with deployment permissions)
+#   workflow_dispatch         trigger: manual
+image: python:3.13
+
+definitions:
+  steps:
+    - step: &test
+        name: Test
+        script:
+          - cd backend && python3 -m unittest -v
+
+pipelines:
+  pull-requests:
+    "**":
+      - step: *test
+  branches:
+    main:
+      - step: *test
+      - step:
+          name: Build, scan and push
+          oidc: true
+          services: [docker]
+          script:
+            - export TAG=${BITBUCKET_COMMIT:0:7}
+            - docker build -t demo-api:$TAG backend
+            - docker build -t demo-web:$TAG frontend
+            # Assume the publish role with the step's OIDC token, then push to ECR
+            # in each region (same commands as the GitHub workflow).
+      - step:
+          name: Release to dev
+          script:
+            - echo "Open a pull request in the GitOps repository that sets the dev image tag."
+            # stg and prd are promoted from the GitOps repository, with approvals there.

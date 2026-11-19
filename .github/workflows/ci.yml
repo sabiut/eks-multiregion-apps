@@ -1,0 +1,111 @@
+# The application pipeline. Continuous integration only: it never touches a cluster, and it
+# does not decide what runs where.
+#
+#   pull request   test the backend, build both images, scan them
+#   merge to main  the same, then push both images to ECR in both regions, and ask the
+#                  GitOps repository to put this version into dev
+#
+# BUILD ONCE: the images are built here, one time, and tagged with the commit. dev, stg and
+# prd all run these exact images. Nothing is rebuilt for a later environment, so what was
+# tested is what ships. Moving a version onward is the GitOps repository's job.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths: ["backend/**", "frontend/**", ".github/workflows/ci.yml"]
+
+permissions:
+  id-token: write   # OIDC token for AWS
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PRIMARY_REGION: ap-southeast-2
+  REGIONS: ap-southeast-2 ap-southeast-1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        working-directory: backend
+        run: python3 -m unittest -v
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - {name: demo-api, context: backend}    # backend tier
+          - {name: demo-web, context: frontend}   # frontend tier
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag
+        id: meta
+        # The tag is the commit, so every image traces back to the code that built it.
+        # Both images get the same tag: one version number describes the whole release.
+        run: echo "tag=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Build
+        run: docker build -t "${{ matrix.name }}:${{ steps.meta.outputs.tag }}" "${{ matrix.context }}"
+      - name: Scan the image for known vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.name }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"   # a critical vulnerability with a fix available stops the release
+      - name: Sign in to AWS
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.PRIMARY_REGION }}
+      - name: Push to ECR in each region
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          IMAGE: ${{ matrix.name }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          account=$(aws sts get-caller-identity --query Account --output text)
+          echo "::add-mask::$account"
+          for region in $REGIONS; do
+            registry="$account.dkr.ecr.$region.amazonaws.com"
+            aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry"
+            docker tag "$IMAGE:$TAG" "$registry/$IMAGE:$TAG"
+            # Tags are immutable in ECR: a second push of the same tag is refused, so a tag
+            # can never come to mean a different image.
+            docker push "$registry/$IMAGE:$TAG"
+          done
+
+  release-to-dev:
+    needs: image
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The release bot is a GitHub App installed on the GitOps repository only. It may
+      # start that repository's promote workflow. It cannot approve or merge anything there.
+      - name: Token for the release bot
+        id: bot
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ vars.GITOPS_REPO_NAME }}
+      - name: Ask the GitOps repository to put this version into dev
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          GITOPS_REPO: ${{ github.repository_owner }}/${{ vars.GITOPS_REPO_NAME }}
+        run: |
+          tag=$(git rev-parse --short=7 HEAD)
+          gh workflow run promote.yml --repo "$GITOPS_REPO" -f to=dev -f tag="$tag"
+          echo "Built \`$tag\` and asked $GITOPS_REPO to promote it to dev." >> "$GITHUB_STEP_SUMMARY"

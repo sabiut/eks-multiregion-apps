@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Three-tier demo</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
+    table { border-collapse: collapse; width: 100%; }
+    td { border-bottom: 1px solid #ccc; padding: .4rem .6rem; }
+    td:first-child { color: #555; width: 40%; }
+    button { font: inherit; padding: .5rem 1rem; margin-top: 1rem; }
+    #error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>Three-tier demo</h1>
+  <p>This page is the frontend tier. The table is filled by the backend tier, and the visit
+     count comes from the database tier.</p>
+  <table id="info"></table>
+  <button id="visit">Record a visit</button>
+  <p id="error"></p>
+  <script>
+    const row = (k, v) => `<tr><td>${k}</td><td>${v}</td></tr>`;
+    async function call(path, options) {
+      const response = await fetch(path, options);
+      return { ok: response.ok, body: await response.json() };
+    }
+    async function refresh(method) {
+      const error = document.getElementById("error");
+      error.textContent = "";
+      try {
+        const info = (await call("/api/info")).body;
+        const visits = await call("/api/visits", { method: method || "GET" });
+        if (!visits.ok) error.textContent = "Database: " + visits.body.error;
+        document.getElementById("info").innerHTML =
+          row("Environment", info.environment) + row("Version", info.version) +
+          row("Region", info.region) + row("Backend pod", info.pod) +
+          row("Greeting from Vault", info.greeting) +
+          row("Visits", visits.ok ? `${visits.body.visits} (${visits.body.store})` : "unavailable");
+      } catch (e) {
+        error.textContent = "The backend did not answer.";
+      }
+    }
+    document.getElementById("visit").addEventListener("click", () => refresh("POST"));
+    refresh();
+  </script>
+</body>
+</html>

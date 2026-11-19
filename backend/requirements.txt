@@ -1,0 +1,2 @@
+# The PostgreSQL driver. Pinned, so a rebuild of the same commit gives the same image.
+psycopg[binary]==3.2.9
